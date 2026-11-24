@@ -4,7 +4,7 @@
 //!
 //! Events: a node going offline and returning, a billing period's traffic
 //! crossing the threshold and the full allowance, expiry dates approaching or
-//! rolled forward, and a sign-in to the panel.
+//! rolled forward, a sign-in to the panel, and a node's 送中 verdict changing.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::IpAddr;
@@ -23,6 +23,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 use crate::api::{answer, Admin};
+use crate::db::Songzhong;
 use crate::{App, Shared};
 
 /// One alert. `node` lists the node names it concerns, comma-separated, and is
@@ -544,6 +545,127 @@ pub struct Watch {
     /// Per node, when it last returned from an absence longer than the grace
     /// period. Absences shorter than that, such as an agent restart, do not count.
     returned: HashMap<i64, i64>,
+    /// Per node, the announced 送中 state. `None` until the first sweep takes
+    /// the stored verdicts as its baseline, silently, as the absence clock
+    /// takes the first sweep's absences.
+    songzhong: Option<HashMap<i64, SzState>>,
+}
+
+/// One node's announced 送中 state, around the verdict the agent last stored.
+///
+/// `alerted_*` are the stacks announced as sent to China and not yet read back
+/// as positively clean. A check that fails leaves a stack unread rather than
+/// clean, so the set survives it: cn, then fail, then ok is one recovery,
+/// announced once, when the ok arrives.
+#[derive(Default)]
+struct SzState {
+    /// The verdict at the previous sweep, which address changes and the
+    /// stacks' own transitions are read against.
+    prev: Option<Songzhong>,
+    alerted_v4: bool,
+    alerted_v6: bool,
+    /// IPv6 announced at reference level -- IPv4 deciding and clean -- and not
+    /// yet read back as positively clean.
+    v6_told: bool,
+}
+
+/// The stack whose verdict decides a node's 送中 state, as `(ipv4, status)`:
+/// IPv4 whenever it has a verdict, IPv6 only when IPv4 has none, as on a
+/// pure-IPv6 node. The status is empty when neither stack has one. The
+/// panel's rule, and the theme's.
+fn deciding(s: &Songzhong) -> (bool, &str) {
+    if s.v4 == "ok" || s.v4 == "cn" {
+        (true, s.v4.as_str())
+    } else if s.v6 == "ok" || s.v6 == "cn" {
+        (false, s.v6.as_str())
+    } else {
+        (true, "")
+    }
+}
+
+impl SzState {
+    /// The state a stored verdict baselines to: what already stands is where
+    /// things are, not news, but a recovery from it is.
+    fn baseline(s: &Songzhong) -> Self {
+        let cn = deciding(s).1 == "cn";
+        SzState {
+            prev: Some(s.clone()),
+            alerted_v4: cn && s.v4 == "cn",
+            alerted_v6: cn && s.v6 == "cn",
+            v6_told: s.v4 == "ok" && s.v6 == "cn",
+        }
+    }
+
+    /// One sweep over this node's new verdict: moves the state and returns
+    /// the alerts the move raises. The caller drops them while no channel is
+    /// configured; the state moves either way, so a channel configured later
+    /// announces only what changes from then on.
+    fn pass(&mut self, name: &str, new: &Songzhong) -> Vec<Note> {
+        let mut out = Vec::new();
+        let note = |title: String, message: String| Note {
+            event: "songzhong",
+            node: name.to_owned(),
+            title,
+            message,
+            ..Default::default()
+        };
+        let (v4_decides, status) = deciding(new);
+        if status == "cn" {
+            if !self.alerted_v4 && !self.alerted_v6 {
+                let stack = if v4_decides { "IPv4" } else { "IPv6" };
+                out.push(note(format!("🚨 {name} 新送中"), format!("{stack} 被 YouTube 判定为中国 CN")));
+            }
+            self.alerted_v4 = new.v4 == "cn";
+            self.alerted_v6 = new.v6 == "cn";
+            // A main alert absorbs a reference one: the node's story is the
+            // alert's now, and the recovery closes both.
+            self.v6_told = false;
+        } else if (self.alerted_v4 || self.alerted_v6)
+            && status == "ok"
+            && (!self.alerted_v4 || new.v4 == "ok")
+            && (!self.alerted_v6 || new.v6 == "ok")
+        {
+            out.push(note(format!("✅ {name} 已恢复"), "未送中".into()));
+            self.alerted_v4 = false;
+            self.alerted_v6 = false;
+            self.v6_told = false;
+        }
+        // Reference level: IPv6 on its own, only while IPv4 decides and is
+        // clean, and never beside a main alert about the same node.
+        if !self.alerted_v4 && !self.alerted_v6 {
+            if new.v4 == "ok" {
+                if new.v6 == "cn" && !self.v6_told {
+                    let message = if new.v4_region.is_empty() {
+                        "仅参考，IPv4 正常".to_owned()
+                    } else {
+                        format!("仅参考，IPv4 判定 {} 正常", new.v4_region)
+                    };
+                    out.push(note(format!("ℹ️ {name} IPv6 送中"), message));
+                    self.v6_told = true;
+                } else if self.v6_told && new.v6 == "ok" {
+                    let message = if new.v6_region.is_empty() {
+                        "未送中".to_owned()
+                    } else {
+                        format!("判定 {}", new.v6_region)
+                    };
+                    out.push(note(format!("ℹ️ {name} IPv6 已恢复"), message));
+                    self.v6_told = false;
+                }
+            } else if !v4_decides {
+                // IPv6 decides on this node, so the main path above owns it.
+                self.v6_told = false;
+            }
+        }
+        if let Some(prev) = &self.prev {
+            for (label, before, after) in [("IPv4", &prev.ip4, &new.ip4), ("IPv6", &prev.ip6, &new.ip6)] {
+                if !before.is_empty() && !after.is_empty() && before != after {
+                    out.push(note(format!("ℹ️ {name} {label} 出口变更"), format!("{before} → {after}")));
+                }
+            }
+        }
+        self.prev = Some(new.clone());
+        out
+    }
 }
 
 pub async fn watch(app: Shared) {
@@ -655,6 +777,30 @@ fn sweep(app: &App, watch: &mut Watch, now: i64, steady: i64) -> Result<Vec<Note
         .flatten()
         .collect();
 
+    // 送中 verdicts: one alert per node per change, never batched -- a change
+    // is rare, and each is about one node's own egress. The first sweep
+    // baselines the stored verdicts silently; a node whose first report
+    // arrives mid-run is judged from nothing, as a first report was judged
+    // before this lived in the hub.
+    let current = app.db.all_songzhong();
+    match &mut watch.songzhong {
+        None => {
+            watch.songzhong = Some(current.into_iter().map(|(id, s)| (id, SzState::baseline(&s))).collect());
+        }
+        Some(states) => {
+            states.retain(|id, _| ids.contains(id));
+            let mut told = Vec::new();
+            for node in &nodes {
+                let Some(verdict) = current.get(&node.id) else { continue };
+                let state = states.entry(node.id).or_default();
+                told.extend(state.pass(&node.name, verdict));
+            }
+            if armed {
+                notes.extend(told);
+            }
+        }
+    }
+
     let percent = number(app, "notify_traffic");
     let mut metered = Vec::new();
     let traffic = if percent > 0 && armed { app.db.all_traffic() } else { HashMap::new() };
@@ -751,7 +897,7 @@ fn gib(bytes: i64) -> String {
 mod tests {
     use super::*;
     use crate::agent_ws::Agent;
-    use crate::db::{Db, Node, NodePatch, TrafficPatch};
+    use crate::db::{Db, Node, NodePatch, Songzhong, TrafficPatch};
 
     fn app() -> App {
         App::for_test(Db::open(":memory:").unwrap())
@@ -1210,5 +1356,174 @@ mod tests {
         assert_eq!(note.title, "⏳ 2 台节点即将到期");
         assert_eq!(note.message, "today · 2026-09-15 今天到期\nsoon · 2026-09-20 还剩 5 天");
         assert!(expiry_digest(&app, at(10)).unwrap().is_none(), "once per day");
+    }
+
+    /// One 送中 verdict, as a node's agent would report it.
+    fn sz(v4: &str, v4_region: &str, v6: &str, v6_region: &str, ip4: &str, ip6: &str) -> Songzhong {
+        Songzhong {
+            v4: v4.into(),
+            v4_region: v4_region.into(),
+            v6: v6.into(),
+            v6_region: v6_region.into(),
+            ip4: ip4.into(),
+            ip6: ip6.into(),
+            checked: 1,
+        }
+    }
+
+    /// Stores one 送中 verdict for a node, as its agent's report would.
+    fn verdict(app: &App, id: i64, s: &Songzhong) {
+        app.db.save_songzhong(id, s).unwrap();
+    }
+
+    /// The 送中 alerts one sweep raises, as (title, message) pairs.
+    fn told(app: &App, watch: &mut Watch) -> Vec<(String, String)> {
+        sweep(app, watch, 0, 0)
+            .unwrap()
+            .into_iter()
+            .filter(|n| n.event == "songzhong")
+            .map(|n| (n.title, n.message))
+            .collect()
+    }
+
+    #[test]
+    fn songzhong_v4_cn_is_announced_once_and_recovery_waits_for_a_positive_ok() {
+        let app = app();
+        with_channel(&app);
+        let id = node(&app, "sz", false, 0);
+        let mut watch = Watch::default();
+
+        verdict(&app, id, &sz("ok", "US", "none", "", "192.0.2.1", ""));
+        assert!(told(&app, &mut watch).is_empty(), "the first sweep baselines silently");
+        verdict(&app, id, &sz("cn", "CN", "none", "", "192.0.2.1", ""));
+        assert_eq!(
+            told(&app, &mut watch),
+            [("🚨 sz 新送中".to_owned(), "IPv4 被 YouTube 判定为中国 CN".to_owned())]
+        );
+        assert!(told(&app, &mut watch).is_empty(), "not repeated while it lasts");
+        verdict(&app, id, &sz("fail", "", "none", "", "192.0.2.1", ""));
+        assert!(told(&app, &mut watch).is_empty(), "a failed check is not a recovery");
+        verdict(&app, id, &sz("ok", "US", "none", "", "192.0.2.1", ""));
+        assert_eq!(
+            told(&app, &mut watch),
+            [("✅ sz 已恢复".to_owned(), "未送中".to_owned())],
+            "the recovery crosses the fail gap, once"
+        );
+        assert!(told(&app, &mut watch).is_empty());
+    }
+
+    #[test]
+    fn songzhong_recovery_needs_every_alerted_stack_back_ok() {
+        let app = app();
+        with_channel(&app);
+        let id = node(&app, "sz", false, 0);
+        let mut watch = Watch::default();
+
+        verdict(&app, id, &sz("ok", "US", "ok", "US", "", ""));
+        assert!(told(&app, &mut watch).is_empty(), "baseline");
+        verdict(&app, id, &sz("cn", "CN", "cn", "CN", "", ""));
+        assert_eq!(told(&app, &mut watch).len(), 1, "one alert for both stacks");
+        verdict(&app, id, &sz("ok", "US", "cn", "CN", "", ""));
+        assert!(told(&app, &mut watch).is_empty(), "IPv6 still reads cn: not a recovery");
+        verdict(&app, id, &sz("ok", "US", "ok", "US", "", ""));
+        assert_eq!(told(&app, &mut watch), [("✅ sz 已恢复".to_owned(), "未送中".to_owned())]);
+    }
+
+    #[test]
+    fn songzhong_v6_alone_is_reference_while_ipv4_decides_clean() {
+        let app = app();
+        with_channel(&app);
+        let id = node(&app, "ref", false, 0);
+        let v6only = node(&app, "v6only", false, 0);
+        let mut watch = Watch::default();
+
+        verdict(&app, id, &sz("ok", "MY", "ok", "MY", "", ""));
+        assert!(told(&app, &mut watch).is_empty(), "baseline");
+        verdict(&app, id, &sz("ok", "MY", "cn", "CN", "", ""));
+        assert_eq!(
+            told(&app, &mut watch),
+            [("ℹ️ ref IPv6 送中".to_owned(), "仅参考，IPv4 判定 MY 正常".to_owned())],
+            "reference level, not an alarm, while IPv4 decides clean"
+        );
+        assert!(told(&app, &mut watch).is_empty(), "not repeated");
+        verdict(&app, id, &sz("ok", "MY", "fail", "", "", ""));
+        assert!(told(&app, &mut watch).is_empty(), "a failed check is not a recovery");
+        verdict(&app, id, &sz("ok", "MY", "ok", "JP", "", ""));
+        assert_eq!(
+            told(&app, &mut watch),
+            [("ℹ️ ref IPv6 已恢复".to_owned(), "判定 JP".to_owned())],
+            "the recovery crosses the fail gap, once"
+        );
+
+        // On a pure-IPv6 node IPv6 decides, so its cn is an alarm.
+        verdict(&app, v6only, &sz("none", "", "ok", "US", "", ""));
+        assert!(told(&app, &mut watch).is_empty(), "a first report of ok is not news");
+        verdict(&app, v6only, &sz("none", "", "cn", "CN", "", ""));
+        assert_eq!(
+            told(&app, &mut watch),
+            [("🚨 v6only 新送中".to_owned(), "IPv6 被 YouTube 判定为中国 CN".to_owned())]
+        );
+    }
+
+    #[test]
+    fn songzhong_an_address_change_is_announced_once() {
+        let app = app();
+        with_channel(&app);
+        let id = node(&app, "sz", false, 0);
+        let mut watch = Watch::default();
+
+        verdict(&app, id, &sz("ok", "US", "ok", "US", "192.0.2.1", "2001:db8::1"));
+        assert!(told(&app, &mut watch).is_empty(), "baseline");
+        verdict(&app, id, &sz("ok", "US", "ok", "US", "192.0.2.2", "2001:db8::1"));
+        assert_eq!(
+            told(&app, &mut watch),
+            [("ℹ️ sz IPv4 出口变更".to_owned(), "192.0.2.1 → 192.0.2.2".to_owned())]
+        );
+        verdict(&app, id, &sz("ok", "US", "ok", "US", "192.0.2.2", "2001:db8::2"));
+        assert_eq!(
+            told(&app, &mut watch),
+            [("ℹ️ sz IPv6 出口变更".to_owned(), "2001:db8::1 → 2001:db8::2".to_owned())]
+        );
+        verdict(&app, id, &sz("ok", "US", "ok", "US", "", ""));
+        assert!(told(&app, &mut watch).is_empty(), "an address vanishing is not a change");
+    }
+
+    #[test]
+    fn songzhong_a_stored_verdict_baselines_silently() {
+        // Already standing when the hub starts: baselined, not announced, but
+        // its recovery is.
+        let app = app();
+        with_channel(&app);
+        let id = node(&app, "sz", false, 0);
+        verdict(&app, id, &sz("cn", "CN", "none", "", "", ""));
+        let mut watch = Watch::default();
+        assert!(told(&app, &mut watch).is_empty(), "the first sweep baselines silently");
+        verdict(&app, id, &sz("ok", "US", "none", "", "", ""));
+        assert_eq!(
+            told(&app, &mut watch),
+            [("✅ sz 已恢复".to_owned(), "未送中".to_owned())],
+            "the baseline kept the alerted state"
+        );
+    }
+
+    #[test]
+    fn songzhong_unarmed_passes_follow_silently() {
+        // No channel: the state follows the verdicts without queueing, so a
+        // channel configured later announces nothing stale.
+        let quiet = app();
+        let id = node(&quiet, "sz", false, 0);
+        let mut watch = Watch::default();
+        verdict(&quiet, id, &sz("ok", "US", "none", "", "", ""));
+        assert!(told(&quiet, &mut watch).is_empty(), "baseline");
+        verdict(&quiet, id, &sz("cn", "CN", "none", "", "", ""));
+        assert!(told(&quiet, &mut watch).is_empty(), "unarmed passes queue nothing");
+        with_channel(&quiet);
+        assert!(told(&quiet, &mut watch).is_empty(), "and nothing stale once armed");
+        verdict(&quiet, id, &sz("ok", "US", "none", "", "", ""));
+        assert_eq!(
+            told(&quiet, &mut watch),
+            [("✅ sz 已恢复".to_owned(), "未送中".to_owned())],
+            "a change after arming is announced"
+        );
     }
 }
