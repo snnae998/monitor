@@ -165,7 +165,12 @@ fn forwarded_proto(headers: &HeaderMap) -> Option<&str> {
 /// Where the agent binaries are published, and where this hub is published. Not
 /// settings: redirecting either implies a fork, which rebuilds these lines
 /// anyway.
-pub const AGENT_REPO: &str = "monitor-probe/agent";
+///
+/// In this fork AGENT_REPO names the fork's agent, which carries the 送中
+/// self-check the stock agent does not have; the relay must serve it rather
+/// than upstream's build. HUB_REPO still names upstream, so the panel's hub
+/// update notices keep tracking upstream releases.
+pub const AGENT_REPO: &str = "snnae998/agent";
 pub const HUB_REPO: &str = "monitor-probe/monitor";
 
 /// The one-line installer pasted onto a new VPS.
@@ -284,9 +289,14 @@ impl<S: futures_core::Stream + Unpin> futures_core::Stream for Metered<S> {
 
 /// The key the agent's release job signs each binary with (ed25519, the raw 32
 /// bytes). Rotating it takes a hub release.
+///
+/// This fork's own key, not upstream's: the matching private key is the
+/// AGENT_SIGNING_KEY secret in the fork's agent repository, and upstream's
+/// binaries -- signed under upstream's key -- are refused by this build's
+/// relay like any other foreign signature.
 const AGENT_SIGNING_KEY: [u8; 32] = [
-    0x9a, 0x7c, 0x5e, 0x29, 0xf8, 0x79, 0x5a, 0x0a, 0x72, 0x12, 0x3e, 0xe1, 0xf0, 0x6a, 0x93, 0x41, 0xf2,
-    0x95, 0x34, 0xdb, 0xc2, 0x85, 0xb9, 0xab, 0xbe, 0xe6, 0xa0, 0x06, 0xdc, 0x65, 0xee, 0xef,
+    0x48, 0x76, 0x4a, 0xcb, 0x9f, 0x79, 0x4c, 0x70, 0x57, 0x76, 0xe4, 0x52, 0x18, 0xe3, 0x15, 0x76, 0xa8,
+    0xf4, 0xff, 0x10, 0x44, 0xf6, 0xdb, 0xe9, 0x1e, 0x0e, 0xff, 0x18, 0x0c, 0x1d, 0x8d, 0xe1,
 ];
 
 /// Far above the 1.8 MB an agent weighs; bounds what a proxy can make the hub
@@ -1497,7 +1507,7 @@ mod tests {
     fn a_github_proxy_prefixes_the_release_url_and_an_empty_one_does_not() {
         let app = app("");
         let direct = release_url(&app, "x86_64");
-        assert!(direct.starts_with("https://github.com/monitor-probe/agent/releases/"), "{direct}");
+        assert!(direct.starts_with("https://github.com/snnae998/agent/releases/"), "{direct}");
 
         for set in ["https://ghfast.top", "https://ghfast.top/", "  https://ghfast.top/  "] {
             app.db.set("github_proxy", set).unwrap();

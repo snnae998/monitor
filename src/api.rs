@@ -206,6 +206,7 @@ fn node_view(
     node: &Node,
     current: Option<&Agent>,
     traffic: &Traffic,
+    songzhong: Option<&crate::db::Songzhong>,
     full: bool,
     now: DateTime<Local>,
 ) -> Value {
@@ -226,6 +227,20 @@ fn node_view(
     // connected but not yet reporting, which is not a timestamp, so it falls
     // back to the stored value and "offline since" survives the gap.
     let last_seen = current.map(|a| a.last_seen).filter(|t| *t > 0).unwrap_or(node.last_seen);
+    // The node's 送中 verdict, public on the same terms as `country` below:
+    // statuses and country codes, never the addresses they were measured
+    // from -- those ride the `full` gate with the rest. Built apart from the
+    // literal: one more nested `json!` in it overflows the macro recursion
+    // limit.
+    let songzhong_view = songzhong.map(|s| {
+        json!({
+            "v4": s.v4,
+            "v4_region": s.v4_region,
+            "v6": s.v6,
+            "v6_region": s.v6_region,
+            "checked": s.checked,
+        })
+    });
     let mut view = json!({
         "id": node.id,
         "name": node.name,
@@ -280,6 +295,7 @@ fn node_view(
         // the public page already shows, so this one is public as well.
         "day_rx": traffic.day_rx,
         "day_tx": traffic.day_tx,
+        "songzhong": songzhong_view,
     });
     // An allowlist rather than a denylist, for the panel as well: the agent ships
     // from its own repository, so a field added there would otherwise reach
@@ -329,6 +345,10 @@ fn node_view(
         view["country_auto"] = json!(node.country);
         view["remark"] = json!(node.remark);
         view["notify"] = json!(node.notify);
+        if let Some(s) = songzhong {
+            view["songzhong"]["ip4"] = json!(s.ip4);
+            view["songzhong"]["ip6"] = json!(s.ip6);
+        }
     }
     view
 }
@@ -338,13 +358,23 @@ fn visible_nodes(app: &App, full: bool) -> Result<Vec<Value>, anyhow::Error> {
     // visitor to the public page loads.
     let nodes = app.db.nodes()?;
     let traffic = app.db.all_traffic();
+    let songzhong = app.db.all_songzhong();
     let agents = app.agents.read().unwrap_or_else(|e| e.into_inner());
     let none = Traffic::default();
     let now = Local::now();
     Ok(nodes
         .iter()
         .filter(|n| full || n.public)
-        .map(|n| node_view(n, agents.get(&n.id), traffic.get(&n.id).unwrap_or(&none), full, now))
+        .map(|n| {
+            node_view(
+                n,
+                agents.get(&n.id),
+                traffic.get(&n.id).unwrap_or(&none),
+                songzhong.get(&n.id),
+                full,
+                now,
+            )
+        })
         .collect())
 }
 

@@ -220,6 +220,21 @@ CREATE TABLE IF NOT EXISTS session (
   token_hash TEXT    PRIMARY KEY,
   expires_at INTEGER NOT NULL
 );
+
+-- 送中 self-check results, one row per node, latest report only. Written by
+-- the agent (which alone can judge its own egress), read by the node list.
+-- Statuses are ok/cn/fail/none per stack; regions are the country YouTube
+-- reported for that stack's egress.
+CREATE TABLE IF NOT EXISTS songzhong (
+  node_id   INTEGER PRIMARY KEY REFERENCES node(id) ON DELETE CASCADE,
+  v4        TEXT    NOT NULL DEFAULT '',
+  v4_region TEXT    NOT NULL DEFAULT '',
+  v6        TEXT    NOT NULL DEFAULT '',
+  v6_region TEXT    NOT NULL DEFAULT '',
+  ip4       TEXT    NOT NULL DEFAULT '',
+  ip6       TEXT    NOT NULL DEFAULT '',
+  checked   INTEGER NOT NULL DEFAULT 0
+);
 "#;
 
 /// Schema revision this build expects, stamped into `PRAGMA user_version`.
@@ -236,7 +251,7 @@ CREATE TABLE IF NOT EXISTS session (
 /// cannot: `open` runs `SCHEMA` before migrating, and on an older file the
 /// column is not there yet. `an_upgraded_release_matches_a_fresh_database`
 /// holds every migration to these rules, starting from v1.0.0's schema.
-const SCHEMA_VERSION: i64 = 13;
+const SCHEMA_VERSION: i64 = 14;
 
 /// Adds a column older databases lack. A duplicate column indicates the
 /// migration has already run; every other error must propagate.
@@ -413,6 +428,24 @@ fn migrate_to_13(conn: &Connection) -> Result<()> {
     add_column(conn, "node", "ip_other TEXT NOT NULL DEFAULT ''")
 }
 
+/// v14 adds the `songzhong` table. The DDL must match SCHEMA's, and
+/// `check_backup` compares the columns to prove it.
+fn migrate_to_14(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS songzhong (
+           node_id   INTEGER PRIMARY KEY REFERENCES node(id) ON DELETE CASCADE,
+           v4        TEXT    NOT NULL DEFAULT '',
+           v4_region TEXT    NOT NULL DEFAULT '',
+           v6        TEXT    NOT NULL DEFAULT '',
+           v6_region TEXT    NOT NULL DEFAULT '',
+           ip4       TEXT    NOT NULL DEFAULT '',
+           ip6       TEXT    NOT NULL DEFAULT '',
+           checked   INTEGER NOT NULL DEFAULT 0
+         );",
+    )?;
+    Ok(())
+}
+
 /// Brings a database already in service up to `SCHEMA_VERSION` and stamps it.
 /// `from` is its current version, so a fresh file passes `SCHEMA_VERSION` and
 /// receives only the stamp.
@@ -465,13 +498,16 @@ fn migrate(conn: &Connection, from: i64) -> Result<()> {
     if from < 13 {
         migrate_to_13(&tx)?;
     }
+    if from < 14 {
+        migrate_to_14(&tx)?;
+    }
     tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
     tx.commit()?;
     Ok(())
 }
 
 /// Every table this build keeps.
-const TABLES: [&str; 10] = [
+const TABLES: [&str; 11] = [
     "setting",
     "node",
     "traffic",
@@ -482,11 +518,12 @@ const TABLES: [&str; 10] = [
     "session",
     "metric_hour",
     "ping_hour",
+    "songzhong",
 ];
 
-/// The tables `migrate_to_11` adds. A backup taken before it lacks them and is
-/// still a backup this build restores.
-const HOURLY_TABLES: [&str; 2] = ["metric_hour", "ping_hour"];
+/// The tables a migration adds (`migrate_to_11`, `migrate_to_14`). A backup
+/// taken before them lacks them and is still a backup this build restores.
+const HOURLY_TABLES: [&str; 3] = ["metric_hour", "ping_hour", "songzhong"];
 
 /// One node's stored configuration and last known facts.
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -639,6 +676,58 @@ fn sum() -> String {
 }
 fn one() -> u32 {
     1
+}
+
+/// One node's latest 送中 self-check: per-stack verdicts (`ok` / `cn` /
+/// `fail` / `none`), the country YouTube reported for each stack's egress,
+/// the egress addresses themselves, and when the agent ran the check. Only
+/// the agent can produce this -- it is a property of the node's own
+/// outbound path, which the hub cannot observe from the receiving end.
+#[derive(Serialize, Debug, Clone, Default)]
+pub struct Songzhong {
+    pub v4: String,
+    pub v4_region: String,
+    pub v6: String,
+    pub v6_region: String,
+    pub ip4: String,
+    pub ip6: String,
+    pub checked: i64,
+}
+
+impl Songzhong {
+    /// Parses one `songzhong.result` frame's params. Anything off-shape --
+    /// an unknown status, a malformed address, a stale or missing stamp --
+    /// refuses the whole frame: half a verdict stored beside a node is
+    /// worse than none, and a capable agent sends the full shape by
+    /// construction, so a refusal can only be a corrupt or foreign sender.
+    pub fn from_params(p: &serde_json::Value) -> Option<Self> {
+        let status = |key: &str| -> Option<String> {
+            let v = p.get(key)?.as_str()?;
+            matches!(v, "ok" | "cn" | "fail" | "none").then(|| v.to_owned())
+        };
+        let region = |key: &str| -> Option<String> {
+            let v = p.get(key)?.as_str()?;
+            (v.len() <= 8 && v.chars().all(|c| c.is_ascii_uppercase() || c == '?')).then(|| v.to_owned())
+        };
+        let addr = |key: &str| -> Option<String> {
+            let v = p.get(key)?.as_str()?;
+            if v.is_empty() || v.parse::<std::net::IpAddr>().is_ok() {
+                Some(v.to_owned())
+            } else {
+                None
+            }
+        };
+        let checked = p.get("checked")?.as_i64().filter(|t| *t > 0)?;
+        Some(Self {
+            v4: status("v4")?,
+            v4_region: region("v4_region")?,
+            v6: status("v6")?,
+            v6_region: region("v6_region")?,
+            ip4: addr("ip4")?,
+            ip6: addr("ip6")?,
+            checked,
+        })
+    }
 }
 
 #[derive(Serialize, Debug, Clone, Default, PartialEq)]
@@ -1492,6 +1581,49 @@ impl Db {
                     month_start: period,
                     day_rx,
                     day_tx,
+                },
+            ))
+        });
+        rows.map(|r| r.flatten().collect()).unwrap_or_default()
+    }
+
+    // ---- songzhong ----
+
+    /// Stores one 送中 report, replacing the node's previous one: the panel
+    /// shows a node's current verdict, not a history of them.
+    pub fn save_songzhong(&self, node_id: i64, s: &Songzhong) -> Result<()> {
+        self.conn().execute(
+            "INSERT INTO songzhong (node_id, v4, v4_region, v6, v6_region, ip4, ip6, checked)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(node_id) DO UPDATE SET
+               v4 = excluded.v4, v4_region = excluded.v4_region,
+               v6 = excluded.v6, v6_region = excluded.v6_region,
+               ip4 = excluded.ip4, ip6 = excluded.ip6, checked = excluded.checked",
+            params![node_id, s.v4, s.v4_region, s.v6, s.v6_region, s.ip4, s.ip6, s.checked],
+        )?;
+        Ok(())
+    }
+
+    /// Every node's latest 送中 verdict in one query, for the node list --
+    /// the same shape as `all_traffic`, for the same reason.
+    pub fn all_songzhong(&self) -> HashMap<i64, Songzhong> {
+        let conn = self.conn();
+        let Ok(mut stmt) = conn
+            .prepare_cached("SELECT node_id, v4, v4_region, v6, v6_region, ip4, ip6, checked FROM songzhong")
+        else {
+            return HashMap::new();
+        };
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                Songzhong {
+                    v4: r.get(1)?,
+                    v4_region: r.get(2)?,
+                    v6: r.get(3)?,
+                    v6_region: r.get(4)?,
+                    ip4: r.get(5)?,
+                    ip6: r.get(6)?,
+                    checked: r.get(7)?,
                 },
             ))
         });
@@ -4366,6 +4498,69 @@ mod tests {
     /// a column `SCHEMA` gained without a migration or the reverse, on an index
     /// in `SCHEMA` over a column only a migration adds, and on a migration that
     /// changes the data when it runs a second time.
+    #[test]
+    fn songzhong_round_trips_and_refuses_off_shape_frames() {
+        let db = db();
+        let id = node(&db, 1);
+        let good = serde_json::json!({
+            "v4": "cn", "v4_region": "CN", "v6": "ok", "v6_region": "US",
+            "ip4": "203.0.113.7", "ip6": "", "checked": 1700000000,
+        });
+        let entry = Songzhong::from_params(&good).expect("a well-formed frame parses");
+        db.save_songzhong(id, &entry).unwrap();
+        let all = db.all_songzhong();
+        let stored = &all[&id];
+        assert_eq!(stored.v4, "cn");
+        assert_eq!(stored.v6_region, "US");
+        assert_eq!(stored.checked, 1700000000);
+
+        // A second report replaces the first: the panel shows the current
+        // verdict, not a history.
+        let newer = Songzhong { v4: "ok".into(), v4_region: "US".into(), ..entry };
+        db.save_songzhong(id, &newer).unwrap();
+        assert_eq!(db.all_songzhong()[&id].v4, "ok");
+
+        let bad_status = serde_json::json!({
+            "v4": "maybe", "v4_region": "CN", "v6": "ok", "v6_region": "US",
+            "ip4": "", "ip6": "", "checked": 1700000000,
+        });
+        assert!(Songzhong::from_params(&bad_status).is_none());
+        let bad_addr = serde_json::json!({
+            "v4": "ok", "v4_region": "US", "v6": "none", "v6_region": "",
+            "ip4": "not-an-address", "ip6": "", "checked": 1700000000,
+        });
+        assert!(Songzhong::from_params(&bad_addr).is_none());
+        let no_stamp = serde_json::json!({
+            "v4": "ok", "v4_region": "US", "v6": "none", "v6_region": "",
+            "ip4": "", "ip6": "", "checked": 0,
+        });
+        assert!(Songzhong::from_params(&no_stamp).is_none());
+    }
+
+    /// A database the previous build stamped 13 has no songzhong table;
+    /// opening it must add the table, stamp 14 and take reports.
+    #[test]
+    fn a_v13_database_gains_the_songzhong_table_on_open() {
+        let scratch = Scratch::new();
+        {
+            let conn = Connection::open(&scratch.0).unwrap();
+            conn.execute_batch(SCHEMA).unwrap();
+            conn.execute_batch("DROP TABLE songzhong; PRAGMA user_version = 13;").unwrap();
+        }
+        let db = Db::open(&scratch.0).unwrap();
+        let version: i64 = db.conn().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        assert!(TABLES.contains(&"songzhong"));
+        let id = node(&db, 1);
+        let entry = Songzhong { v4: "ok".into(), v4_region: "US".into(), checked: 1, ..Default::default() };
+        db.save_songzhong(id, &entry).unwrap();
+        assert_eq!(db.all_songzhong()[&id].v4, "ok");
+        // Reopening changes nothing: the migration tolerates its own rerun.
+        drop(db);
+        let db = Db::open(&scratch.0).unwrap();
+        assert_eq!(db.all_songzhong()[&id].v4, "ok");
+    }
+
     #[test]
     fn an_upgraded_release_matches_a_fresh_database() {
         let scratch = Scratch::new();

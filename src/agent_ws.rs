@@ -598,6 +598,15 @@ fn dispatch(
             debug!("node {node_id}: a report within {REPORT_SPACING:?} of the last was dropped")
         }
         "report" => report(app, node_id, rpc.params, arrival)?,
+        "songzhong.result" => {
+            // A verdict the agent reached about its own egress. An
+            // off-shape frame is refused silently, like an unknown method:
+            // the check is advisory, and a session reporting good metrics
+            // must not die over a malformed extra.
+            if let Some(entry) = crate::db::Songzhong::from_params(&rpc.params) {
+                app.db.save_songzhong(node_id, &entry)?;
+            }
+        }
         "ping.result" if !session.admit_result(arrival.tick) => session.complain(
             node_id,
             format_args!(
