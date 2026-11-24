@@ -168,12 +168,27 @@ CREATE TABLE IF NOT EXISTS plugin_data (
   updated_at INTEGER NOT NULL,
   PRIMARY KEY (plugin_id, record_key)
 );
+
+-- 送中 self-check results, one row per node, latest report only. Written by
+-- the agent (which alone can judge its own egress), read by the node list.
+-- Statuses are ok/cn/fail/none per stack; regions are the country YouTube
+-- reported for that stack's egress.
+CREATE TABLE IF NOT EXISTS songzhong (
+  node_id   INTEGER PRIMARY KEY REFERENCES node(id) ON DELETE CASCADE,
+  v4        TEXT    NOT NULL DEFAULT '',
+  v4_region TEXT    NOT NULL DEFAULT '',
+  v6        TEXT    NOT NULL DEFAULT '',
+  v6_region TEXT    NOT NULL DEFAULT '',
+  ip4       TEXT    NOT NULL DEFAULT '',
+  ip6       TEXT    NOT NULL DEFAULT '',
+  checked   INTEGER NOT NULL DEFAULT 0
+);
 "#;
 
 /// Schema revision this build expects, stamped into `PRAGMA user_version`.
 /// Increment it and add a `migrate_to_N` when the schema changes under a
 /// database already in service.
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 
 /// 两段式删列迁移(GATED_VERSION)未完成时停留的版本号。写成一个**绝对**的
 /// 常量而不是 `SCHEMA_VERSION - 1`:后者会随下一次升版一起漂走,把「v6 迁移
@@ -318,6 +333,24 @@ fn migrate_to_8(conn: &Connection) -> Result<()> {
     add_column(conn, "node", "public_remark TEXT NOT NULL DEFAULT ''")
 }
 
+/// v9 adds the `songzhong` table. Same pattern as v4/v5: the DDL must match
+/// SCHEMA's, and `check_backup` compares the columns to prove it.
+fn migrate_to_9(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS songzhong (
+           node_id   INTEGER PRIMARY KEY REFERENCES node(id) ON DELETE CASCADE,
+           v4        TEXT    NOT NULL DEFAULT '',
+           v4_region TEXT    NOT NULL DEFAULT '',
+           v6        TEXT    NOT NULL DEFAULT '',
+           v6_region TEXT    NOT NULL DEFAULT '',
+           ip4       TEXT    NOT NULL DEFAULT '',
+           ip6       TEXT    NOT NULL DEFAULT '',
+           checked   INTEGER NOT NULL DEFAULT 0
+         );",
+    )?;
+    Ok(())
+}
+
 /// v4 adds the `plugin` and `notification_log` tables and moves nothing. On a
 /// database opened through `Db::open` the schema batch has already created
 /// them by the time any migration runs; a backup candidate in `check_backup`
@@ -455,13 +488,19 @@ fn migrate(conn: &Connection, from: i64) -> Result<()> {
     if from < 8 {
         migrate_to_8(conn)?;
     }
+    // v9 likewise stays off the gate: the songzhong write path runs on every
+    // capable agent's report, and a database stuck at GATED_VERSION must
+    // still take it. CREATE TABLE IF NOT EXISTS tolerates the rerun.
+    if from < 9 {
+        migrate_to_9(conn)?;
+    }
     let stamped = if at_six { SCHEMA_VERSION } else { GATED_VERSION };
     conn.execute_batch(&format!("PRAGMA user_version = {stamped}"))?;
     Ok(())
 }
 
 /// Every table a backup must carry before this build will restore it.
-const TABLES: [&str; 11] = [
+const TABLES: [&str; 12] = [
     "setting",
     "node",
     "traffic",
@@ -473,6 +512,7 @@ const TABLES: [&str; 11] = [
     "plugin",
     "notification_log",
     "plugin_data",
+    "songzhong",
 ];
 
 /// One node's stored configuration and last known facts.
@@ -583,6 +623,58 @@ fn sum() -> String {
 }
 fn one() -> u32 {
     1
+}
+
+/// One node's latest 送中 self-check: per-stack verdicts (`ok` / `cn` /
+/// `fail` / `none`), the country YouTube reported for each stack's egress,
+/// the egress addresses themselves, and when the agent ran the check. Only
+/// the agent can produce this -- it is a property of the node's own
+/// outbound path, which the hub cannot observe from the receiving end.
+#[derive(Serialize, Debug, Clone, Default)]
+pub struct Songzhong {
+    pub v4: String,
+    pub v4_region: String,
+    pub v6: String,
+    pub v6_region: String,
+    pub ip4: String,
+    pub ip6: String,
+    pub checked: i64,
+}
+
+impl Songzhong {
+    /// Parses one `songzhong.result` frame's params. Anything off-shape --
+    /// an unknown status, a malformed address, a stale or missing stamp --
+    /// refuses the whole frame: half a verdict stored beside a node is
+    /// worse than none, and a capable agent sends the full shape by
+    /// construction, so a refusal can only be a corrupt or foreign sender.
+    pub fn from_params(p: &serde_json::Value) -> Option<Self> {
+        let status = |key: &str| -> Option<String> {
+            let v = p.get(key)?.as_str()?;
+            matches!(v, "ok" | "cn" | "fail" | "none").then(|| v.to_owned())
+        };
+        let region = |key: &str| -> Option<String> {
+            let v = p.get(key)?.as_str()?;
+            (v.len() <= 8 && v.chars().all(|c| c.is_ascii_uppercase() || c == '?')).then(|| v.to_owned())
+        };
+        let addr = |key: &str| -> Option<String> {
+            let v = p.get(key)?.as_str()?;
+            if v.is_empty() || v.parse::<std::net::IpAddr>().is_ok() {
+                Some(v.to_owned())
+            } else {
+                None
+            }
+        };
+        let checked = p.get("checked")?.as_i64().filter(|t| *t > 0)?;
+        Some(Self {
+            v4: status("v4")?,
+            v4_region: region("v4_region")?,
+            v6: status("v6")?,
+            v6_region: region("v6_region")?,
+            ip4: addr("ip4")?,
+            ip6: addr("ip6")?,
+            checked,
+        })
+    }
 }
 
 #[derive(Serialize, Debug, Clone, Default)]
@@ -1389,6 +1481,47 @@ impl Db {
     ///
     /// The chart's `task_id IN (assignments)` filter hides both afterwards, but
     /// does not prevent the write, its storage, or the id being reused.
+    /// Stores one 送中 report, replacing the node's previous one: the panel
+    /// shows a node's current verdict, not a history of them.
+    pub fn save_songzhong(&self, node_id: i64, s: &Songzhong) -> Result<()> {
+        self.conn().execute(
+            "INSERT INTO songzhong (node_id, v4, v4_region, v6, v6_region, ip4, ip6, checked)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(node_id) DO UPDATE SET
+               v4 = excluded.v4, v4_region = excluded.v4_region,
+               v6 = excluded.v6, v6_region = excluded.v6_region,
+               ip4 = excluded.ip4, ip6 = excluded.ip6, checked = excluded.checked",
+            params![node_id, s.v4, s.v4_region, s.v6, s.v6_region, s.ip4, s.ip6, s.checked],
+        )?;
+        Ok(())
+    }
+
+    /// Every node's latest 送中 verdict in one query, for the node list --
+    /// the same shape as `all_traffic`, for the same reason.
+    pub fn all_songzhong(&self) -> HashMap<i64, Songzhong> {
+        let conn = self.conn();
+        let Ok(mut stmt) = conn
+            .prepare_cached("SELECT node_id, v4, v4_region, v6, v6_region, ip4, ip6, checked FROM songzhong")
+        else {
+            return HashMap::new();
+        };
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                Songzhong {
+                    v4: r.get(1)?,
+                    v4_region: r.get(2)?,
+                    v6: r.get(3)?,
+                    v6_region: r.get(4)?,
+                    ip4: r.get(5)?,
+                    ip6: r.get(6)?,
+                    checked: r.get(7)?,
+                },
+            ))
+        });
+        rows.map(|r| r.flatten().collect()).unwrap_or_default()
+    }
+
     pub fn insert_ping(&self, node_id: i64, task_id: i64, ts: i64, latency: i64) -> Result<()> {
         self.conn().execute(
             "INSERT OR REPLACE INTO ping_record (node_id, task_id, ts, latency)
@@ -2912,10 +3045,10 @@ mod tests {
     /// also never grows the retired financial columns: `SCHEMA` no longer
     /// declares them.
     #[test]
-    fn a_fresh_database_is_on_schema_v8_with_the_new_tables() {
+    fn a_fresh_database_is_on_schema_v9_with_the_new_tables() {
         let db = db();
         let conn = db.conn();
-        assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 8);
+        assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 9);
         let table = |name: &str| {
             conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1", [name], |r| {
                 r.get::<_, i64>(0)
@@ -2925,6 +3058,7 @@ mod tests {
         assert_eq!(table("plugin"), 1);
         assert_eq!(table("notification_log"), 1);
         assert_eq!(table("plugin_data"), 1);
+        assert_eq!(table("songzhong"), 1);
         let node_columns = columns_of(&conn, "node").unwrap();
         for retired in ["price", "currency", "billing_cycle", "expires_at"] {
             assert!(!node_columns.contains(retired), "新库不该带退役列 {retired}");
@@ -2939,6 +3073,46 @@ mod tests {
         assert!(TABLES.contains(&"plugin"));
         assert!(TABLES.contains(&"notification_log"));
         assert!(TABLES.contains(&"plugin_data"));
+        assert!(TABLES.contains(&"songzhong"));
+    }
+
+    #[test]
+    fn songzhong_round_trips_and_refuses_off_shape_frames() {
+        let db = db();
+        let id = node(&db, 1);
+        let good = serde_json::json!({
+            "v4": "cn", "v4_region": "CN", "v6": "ok", "v6_region": "US",
+            "ip4": "203.0.113.7", "ip6": "", "checked": 1700000000,
+        });
+        let entry = Songzhong::from_params(&good).expect("a well-formed frame parses");
+        db.save_songzhong(id, &entry).unwrap();
+        let all = db.all_songzhong();
+        let stored = &all[&id];
+        assert_eq!(stored.v4, "cn");
+        assert_eq!(stored.v6_region, "US");
+        assert_eq!(stored.checked, 1700000000);
+
+        // A second report replaces the first: the panel shows the current
+        // verdict, not a history.
+        let newer = Songzhong { v4: "ok".into(), v4_region: "US".into(), ..entry };
+        db.save_songzhong(id, &newer).unwrap();
+        assert_eq!(db.all_songzhong()[&id].v4, "ok");
+
+        let bad_status = serde_json::json!({
+            "v4": "maybe", "v4_region": "CN", "v6": "ok", "v6_region": "US",
+            "ip4": "", "ip6": "", "checked": 1700000000,
+        });
+        assert!(Songzhong::from_params(&bad_status).is_none());
+        let bad_addr = serde_json::json!({
+            "v4": "ok", "v4_region": "US", "v6": "none", "v6_region": "",
+            "ip4": "not-an-address", "ip6": "", "checked": 1700000000,
+        });
+        assert!(Songzhong::from_params(&bad_addr).is_none());
+        let no_stamp = serde_json::json!({
+            "v4": "ok", "v4_region": "US", "v6": "none", "v6_region": "",
+            "ip4": "", "ip6": "", "checked": 0,
+        });
+        assert!(Songzhong::from_params(&no_stamp).is_none());
     }
 
     /// A database left at v3 by the previous build: opening it must stamp the
@@ -2946,7 +3120,7 @@ mod tests {
     /// held. Opening the result again must not redo anything that cannot be
     /// redone.
     #[test]
-    fn a_v3_database_upgrades_to_v8_and_reopens_cleanly() {
+    fn a_v3_database_upgrades_to_v9_and_reopens_cleanly() {
         let file = std::env::temp_dir().join(format!("monitor-v3-{}.db", std::process::id()));
         let _ = std::fs::remove_file(&file);
         let path = file.to_str().unwrap();
@@ -2967,7 +3141,7 @@ mod tests {
 
         let db = Db::open(path).unwrap();
         let conn = db.conn();
-        assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 8);
+        assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 9);
         for table in ["plugin", "notification_log", "plugin_data"] {
             let found: i64 = conn
                 .query_row(
@@ -2984,7 +3158,7 @@ mod tests {
         // Reopening is a no-op: the migration chain stops before the stamp.
         drop(db);
         let again = Db::open(path).unwrap();
-        assert_eq!(again.conn().query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 8);
+        assert_eq!(again.conn().query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 9);
         drop(again);
         let _ = std::fs::remove_file(&file);
     }
@@ -3036,7 +3210,7 @@ mod tests {
 
         let db = Db::open(path).unwrap();
         let conn = db.conn();
-        assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 8);
+        assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 9);
         assert!(columns_of(&conn, "node").unwrap().contains("observed_ip"), "migrate_to_7 必须加上这一列");
         drop(conn);
         assert_eq!(db.nodes().unwrap().len(), 1, "升级保留原有节点");
@@ -3190,7 +3364,7 @@ mod tests {
         drop(db);
 
         let db = Db::open(path).unwrap();
-        assert_eq!(db.conn().query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 8);
+        assert_eq!(db.conn().query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 9);
         let columns = columns_of(&db.conn(), "node").unwrap();
         for retired in ["price", "currency", "billing_cycle", "expires_at"] {
             assert!(!columns.contains(retired), "导入完成后 {retired} 应已删除");
@@ -3226,7 +3400,7 @@ mod tests {
         // must pass every gate and come out with the newer tables created.
         live.check_backup(&old_path).unwrap();
         let checked = Connection::open(&old_path).unwrap();
-        assert_eq!(checked.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 8);
+        assert_eq!(checked.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 9);
         for table in ["plugin", "notification_log", "plugin_data"] {
             let found: i64 = checked
                 .query_row(

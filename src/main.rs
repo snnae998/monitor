@@ -157,7 +157,10 @@ fn forwarded_proto(headers: &HeaderMap) -> Option<&str> {
 
 /// Where the agent binaries are published. Not a setting: redirecting it
 /// implies a fork, which rebuilds this line anyway.
-const AGENT_REPO: &str = "CarlJia/agent";
+// Local patch (snnae998 fork): the fleet runs the fork's agent, whose
+// songzhong self-check the stock agent does not have; the relay must serve
+// that build or every --upgrade would silently remove the feature.
+const AGENT_REPO: &str = "snnae998/agent";
 
 /// The one-line installer pasted onto a new VPS.
 async fn install_script() -> Response {
@@ -1036,7 +1039,7 @@ mod tests {
     fn a_github_proxy_prefixes_the_release_url_and_an_empty_one_does_not() {
         let app = app("");
         let direct = release_url(&app, "x86_64");
-        assert!(direct.starts_with("https://github.com/CarlJia/agent/releases/"), "{direct}");
+        assert!(direct.starts_with("https://github.com/snnae998/agent/releases/"), "{direct}");
 
         for set in ["https://ghfast.top", "https://ghfast.top/", "  https://ghfast.top/  "] {
             app.db.set("github_proxy", set).unwrap();

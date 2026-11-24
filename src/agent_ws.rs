@@ -315,6 +315,15 @@ fn dispatch(app: &App, node_id: i64, ip: &str, bytes: &[u8]) -> Result<Option<St
             return Ok(owed.then_some(geo));
         }
         "report" => report(app, node_id, rpc.params)?,
+        "songzhong.result" => {
+            // A verdict the agent reached about its own egress. An
+            // off-shape frame is refused silently, like an unknown method:
+            // the check is advisory, and a session reporting good metrics
+            // must not die over a malformed extra.
+            if let Some(entry) = crate::db::Songzhong::from_params(&rpc.params) {
+                app.db.save_songzhong(node_id, &entry)?;
+            }
+        }
         "ping.result" => {
             let task_id = rpc.params.get("task_id").and_then(|v| v.as_i64()).unwrap_or(0);
             // A missing reading is not a reading of -1: `close_bucket` counts

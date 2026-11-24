@@ -74,7 +74,13 @@ pub(crate) const PUBLIC_METRICS: [&str; 18] = [
 
 /// One node as the UI consumes it: stored config, live metrics and the hub's
 /// accumulated traffic in a single object.
-fn node_view(node: &Node, current: Option<&Agent>, traffic: &Traffic, full: bool) -> Value {
+fn node_view(
+    node: &Node,
+    current: Option<&Agent>,
+    traffic: &Traffic,
+    songzhong: Option<&crate::db::Songzhong>,
+    full: bool,
+) -> Value {
     // The three capacities arrive twice: once in `Facts`, sent at the handshake
     // and stored, and again in every `Metrics`. A machine that gains a disk while
     // the agent is running -- the agent re-reads its mount table every sample so
@@ -129,6 +135,16 @@ fn node_view(node: &Node, current: Option<&Agent>, traffic: &Traffic, full: bool
         // The raw source is trusted admin content and passed through unsanitized
         // (see plan R6/KTD2); the private `remark` stays behind the `full` gate below.
         "public_remark_html": crate::markdown::render_public_remark(&node.public_remark),
+        // The node's 送中 verdict, public on the same terms as `country`
+        // above: statuses and country codes, never the addresses they were
+        // measured from -- those ride the `full` gate below with the rest.
+        "songzhong": songzhong.map(|s| json!({
+            "v4": s.v4,
+            "v4_region": s.v4_region,
+            "v6": s.v6,
+            "v6_region": s.v6_region,
+            "checked": s.checked,
+        })),
     });
     // An allowlist rather than a denylist: the agent ships from its own
     // repository, so a field added there would otherwise reach anonymous visitors
@@ -150,6 +166,10 @@ fn node_view(node: &Node, current: Option<&Agent>, traffic: &Traffic, full: bool
         view["ipv6"] = json!(node.ipv6);
         view["observed_ip"] = json!(node.observed_ip);
         view["remark"] = json!(node.remark);
+        if let Some(s) = songzhong {
+            view["songzhong"]["ip4"] = json!(s.ip4);
+            view["songzhong"]["ip6"] = json!(s.ip6);
+        }
         // The rendered HTML is already in the base view above; the admin frame also
         // carries the raw source so the panel editor can load it back for editing.
         view["public_remark"] = json!(node.public_remark);
@@ -163,12 +183,15 @@ fn visible_nodes(app: &App, full: bool) -> Result<Vec<Value>, anyhow::Error> {
     // visitor to the public page loads.
     let nodes = app.db.nodes()?;
     let traffic = app.db.all_traffic();
+    let songzhong = app.db.all_songzhong();
     let agents = app.agents.read().unwrap_or_else(|e| e.into_inner());
     let none = Traffic::default();
     Ok(nodes
         .iter()
         .filter(|n| full || n.public)
-        .map(|n| node_view(n, agents.get(&n.id), traffic.get(&n.id).unwrap_or(&none), full))
+        .map(|n| {
+            node_view(n, agents.get(&n.id), traffic.get(&n.id).unwrap_or(&none), songzhong.get(&n.id), full)
+        })
         .collect())
 }
 
