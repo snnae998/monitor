@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState, useSyncExternalStore } from "react"
-import { ExternalLink, LogOut, Moon, Sun } from "lucide-react"
+import { ExternalLink, LogOut, Moon, Sun, SunMoon } from "lucide-react"
 import { Toaster } from "sonner"
 
 import { Admin } from "@/components/Admin"
@@ -8,6 +8,7 @@ import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
 import { TooltipProvider } from "@/components/ui/tooltip"
 import { api, provisionRefusal, useNodes } from "@/lib/api"
+import { isDarkMode, nextThemeMode, readThemeMode, saveThemeMode, THEME_MODE_LABEL } from "@/lib/theme-mode"
 
 type Me = { authed: boolean; github: boolean; site_name: string; public_page: boolean; site: string }
 
@@ -42,25 +43,18 @@ function usePath() {
 const DARK_MEDIA = matchMedia("(prefers-color-scheme: dark)")
 
 /**
- * The operator's own choice, or the system's while there is none. Only the toggle
- * writes the choice down: persisting the system's answer on load would pin it,
- * and the public theme served from the same origin reads this key too, so one
- * visit to the panel would leave the status page in whichever mode the system
- * happened to be in at that moment, no longer following it.
+ * The operator's mode: follow the system, or force light / dark. The header
+ * button cycles auto -> light -> dark -> auto, so follow-the-system is a
+ * state the button can reach again — the old toggle only ever wrote light
+ * or dark, pinning the panel the first time it was touched, with no way back
+ * to following the system short of clearing site data.
  *
  * The system's answer is subscribed to rather than copied into state: a flip
  * landing between the first render and the effect that would have attached the
  * listener is otherwise never heard, and the next one is a day away.
  */
 function useTheme() {
-  // Storage can be switched off for the site, and then even reading it throws.
-  const [saved, setSaved] = useState(() => {
-    try {
-      return localStorage.getItem("theme")
-    } catch {
-      return null
-    }
-  })
+  const [mode, setMode] = useState(readThemeMode)
   const system = useSyncExternalStore(
     (notify) => {
       DARK_MEDIA.addEventListener("change", notify)
@@ -68,7 +62,7 @@ function useTheme() {
     },
     () => DARK_MEDIA.matches,
   )
-  const dark = saved ? saved === "dark" : system
+  const dark = isDarkMode(mode, system)
 
   // Switched with every transition held. Buttons, badges and table rows fade
   // their colours over 150 ms while everything else changes at once, leaving
@@ -84,23 +78,18 @@ function useTheme() {
     hold.remove()
   }, [dark])
 
-  return [
-    dark,
-    () => {
-      const next = dark ? "light" : "dark"
-      try {
-        localStorage.setItem("theme", next)
-      } catch {
-        // The choice then lasts until the page is closed.
-      }
-      setSaved(next)
-    },
-  ] as const
+  const cycleTheme = useCallback(() => {
+    const next = nextThemeMode(mode)
+    saveThemeMode(next)
+    setMode(next)
+  }, [mode])
+
+  return { mode, dark, cycleTheme }
 }
 
 export default function App() {
   const [path, go] = usePath()
-  const [dark, toggleTheme] = useTheme()
+  const { mode, dark, cycleTheme } = useTheme()
   const [me, setMe] = useState<Me | null>(null)
   const [meError, setMeError] = useState("")
   const { nodes, admin, error, refresh } = useNodes()
@@ -168,8 +157,8 @@ export default function App() {
                 <ExternalLink /> 状态面板
               </a>
             </Button>
-            <Button variant="ghost" size="icon" onClick={toggleTheme} title="切换主题">
-              {dark ? <Sun /> : <Moon />}
+            <Button variant="ghost" size="icon" onClick={cycleTheme} title={`切换主题（当前：${THEME_MODE_LABEL[mode]}）`}>
+              {mode === "auto" ? <SunMoon /> : mode === "light" ? <Sun /> : <Moon />}
             </Button>
             <Button variant="ghost" size="icon" onClick={signOut} title="退出登录">
               <LogOut />
